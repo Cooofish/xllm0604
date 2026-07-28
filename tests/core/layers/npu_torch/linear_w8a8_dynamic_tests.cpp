@@ -23,6 +23,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/common/flash_comm1_context.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
@@ -305,6 +306,131 @@ TEST_F(NpuLinearW8A8DynamicTest, RowParallelLinearLoadAndForward) {
   Device(options_.device()).synchronize_default_stream();
 
   auto expected = make_reference_output(input, weight, weight_scale, bias);
+  ASSERT_TRUE(output.sizes() == expected.sizes());
+  expect_output_close(output, expected);
+}
+
+TEST_F(NpuLinearW8A8DynamicTest,
+       RowParallelLinearFallsBackToReduceScatterForFlashComm) {
+  const int32_t num_tokens = 4;
+  const int64_t in_features = 20;
+  const int64_t local_in_features = 10;
+  const int64_t out_features = 10;
+  const std::string prefix = "npu.linear.row.flashcomm";
+  add_quant_desc(prefix);
+
+  mock_process_group_ = std::make_unique<test::MockProcessGroup>(
+      options_.device(), /*rank=*/0, /*world_size=*/2);
+  auto linear = RowParallelLinear(RowParallelLinearImpl(
+      in_features,
+      out_features,
+      /*bias=*/true,
+      /*input_is_parallelized=*/true,
+      /*enable_result_reduction=*/true,
+      quant_args_,
+      mock_process_group_.get(),
+      options_));
+
+  auto weight = make_qweight(
+      "npu.linear.row.flashcomm.weight", out_features, local_in_features);
+  auto weight_scale =
+      make_weight_scale("npu.linear.row.flashcomm.scale", out_features);
+  auto weight_offset =
+      make_weight_offset("npu.linear.row.flashcomm.offset", out_features);
+  auto bias = make_bias("npu.linear.row.flashcomm.bias", out_features);
+
+  std::unordered_map<std::string, torch::Tensor> weight_dict = {
+      {"weight", weight},
+      {"weight_scale", weight_scale},
+      {"weight_offset", weight_offset},
+      {"bias", bias},
+  };
+  StateDict state_dict = make_quant_state_dict(std::move(weight_dict), prefix);
+  linear->load_state_dict(state_dict);
+
+  FlashComm1Context context;
+  context.enabled = true;
+  context.tp_rank = 0;
+  context.tp_world_size = 2;
+  context.original_num_tokens = num_tokens;
+  context.padded_num_tokens = num_tokens;
+  context.padded_local_num_tokens = num_tokens / context.tp_world_size;
+  context.enable_mmrs_fusion = true;
+  context.tp_group = mock_process_group_.get();
+  FlashComm1ContextScope context_scope(&context);
+
+  auto input = make_input(
+      "npu.linear.row.flashcomm.input", num_tokens, local_in_features);
+  auto output = linear->forward(
+      input, RowParallelReduceMode::MATMUL_REDUCE_SCATTER);
+  Device(options_.device()).synchronize_default_stream();
+
+  auto full_output = make_reference_output(input, weight, weight_scale, bias);
+  auto expected = full_output.slice(0, 0, context.padded_local_num_tokens);
+  ASSERT_TRUE(output.sizes() == expected.sizes());
+  expect_output_close(output, expected);
+}
+
+TEST_F(NpuLinearW8A8StaticTest,
+       RowParallelLinearFallsBackToReduceScatterForFlashComm) {
+  const int32_t num_tokens = 4;
+  const int64_t in_features = 20;
+  const int64_t local_in_features = 10;
+  const int64_t out_features = 10;
+  const std::string prefix = "npu.linear.row.flashcomm.static";
+  add_quant_desc(prefix);
+
+  mock_process_group_ = std::make_unique<test::MockProcessGroup>(
+      options_.device(), /*rank=*/0, /*world_size=*/2);
+  auto linear = RowParallelLinear(RowParallelLinearImpl(
+      in_features,
+      out_features,
+      /*bias=*/false,
+      /*input_is_parallelized=*/true,
+      /*enable_result_reduction=*/true,
+      quant_args_,
+      mock_process_group_.get(),
+      options_));
+
+  auto weight = make_qweight(
+      "npu.linear.row.flashcomm.static.weight", out_features, local_in_features);
+  auto input_scale = make_input_scale();
+  auto input_offset = make_input_offset();
+  auto deq_scale = make_deq_scale(
+      "npu.linear.row.flashcomm.static.deq_scale", out_features);
+  auto quant_bias = make_quant_bias(
+      "npu.linear.row.flashcomm.static.quant_bias", out_features);
+
+  std::unordered_map<std::string, torch::Tensor> weight_dict = {
+      {"weight", weight},
+      {"input_scale", input_scale},
+      {"input_offset", input_offset},
+      {"deq_scale", deq_scale},
+      {"quant_bias", quant_bias},
+  };
+  StateDict state_dict = make_quant_state_dict(std::move(weight_dict), prefix);
+  linear->load_state_dict(state_dict);
+
+  FlashComm1Context context;
+  context.enabled = true;
+  context.tp_rank = 0;
+  context.tp_world_size = 2;
+  context.original_num_tokens = num_tokens;
+  context.padded_num_tokens = num_tokens;
+  context.padded_local_num_tokens = num_tokens / context.tp_world_size;
+  context.enable_mmrs_fusion = true;
+  context.tp_group = mock_process_group_.get();
+  FlashComm1ContextScope context_scope(&context);
+
+  auto input = make_input(
+      "npu.linear.row.flashcomm.static.input", num_tokens, local_in_features);
+  auto output = linear->forward(
+      input, RowParallelReduceMode::MATMUL_REDUCE_SCATTER);
+  Device(options_.device()).synchronize_default_stream();
+
+  auto full_output = make_unflattened_kernel_reference_output(
+      input, weight, input_scale, input_offset, deq_scale, quant_bias);
+  auto expected = full_output.slice(0, 0, context.padded_local_num_tokens);
   ASSERT_TRUE(output.sizes() == expected.sizes());
   expect_output_close(output, expected);
 }

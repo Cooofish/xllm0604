@@ -210,21 +210,48 @@ bool wants_mmrs(RowParallelReduceMode reduce_mode) {
   return reduce_mode == RowParallelReduceMode::MATMUL_REDUCE_SCATTER;
 }
 
-void log_mmrs_quant_skip(RowParallelReduceMode reduce_mode,
-                         const FlashComm1Context* fc1_ctx,
-                         const char* quant_path,
-                         const torch::Tensor& input) {
-  if (!wants_mmrs(reduce_mode)) {
-    return;
+const char* get_mmrs_unsupported_quant_path(
+    const QuantArgs& quant_args,
+    const std::optional<std::string>& resolved_weight_quant_method) {
+  if (quant_args.quant_method() == kQuantMethodSmoothquant) {
+    return "smoothquant";
   }
+  if (quant_args.quant_method() == kQuantMethodFp8) {
+    return "fp8";
+  }
+  if (is_w8a8_quant(resolved_weight_quant_method)) {
+    return "w8a8";
+  }
+  if (is_w8a8_dynamic_quant(resolved_weight_quant_method)) {
+    return "w8a8_dynamic";
+  }
+  return nullptr;
+}
+
+RowParallelReduceMode resolve_mmrs_reduce_mode(
+    RowParallelReduceMode reduce_mode,
+    const QuantArgs& quant_args,
+    const std::optional<std::string>& resolved_weight_quant_method,
+    const FlashComm1Context* fc1_ctx,
+    const torch::Tensor& input) {
+  if (!wants_mmrs(reduce_mode)) {
+    return reduce_mode;
+  }
+
+  const char* quant_path = get_mmrs_unsupported_quant_path(
+      quant_args, resolved_weight_quant_method);
+  if (quant_path == nullptr) {
+    return reduce_mode;
+  }
+
   LOG_FIRST_N(WARNING, 16)
-      << "FC1 MMRS skipped in row-parallel " << quant_path
-      << " path: fused matmul_reduce_scatter is currently wired only for "
-         "non-quant linear. input="
+      << "FC1 MMRS does not support row-parallel " << quant_path
+      << "; using quantized matmul + reduce_scatter. input="
       << input.sizes() << ", sequence_sharded="
       << (fc1_ctx != nullptr && is_sequence_sharded(*fc1_ctx))
       << ", enable_mmrs_fusion="
       << (fc1_ctx != nullptr && fc1_ctx->enable_mmrs_fusion);
+  return RowParallelReduceMode::REDUCE_SCATTER;
 }
 
 bool is_fp8_channelwise_w8a8(const QuantArgs& quant_args) {
@@ -1427,6 +1454,11 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
   const bool use_fc1_reduce = false;
   const FlashComm1Context* fc1_ctx = nullptr;
 #endif
+  reduce_mode = resolve_mmrs_reduce_mode(reduce_mode,
+                                         quant_args_,
+                                         resolved_weight_quant_method_,
+                                         fc1_ctx,
+                                         input);
   auto bias = bias_.defined() && rank_ == 0
                   ? std::optional<torch::Tensor>(bias_)
                   : std::nullopt;
@@ -1436,7 +1468,6 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
 
   torch::Tensor output;
   if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
-    log_mmrs_quant_skip(reduce_mode, fc1_ctx, "smoothquant", input);
     CHECK(smooth_.defined()) << "smooth is required for smoothquant.";
     CHECK(qweight_.defined()) << "qweight is required for smoothquant.";
     CHECK(per_channel_scale_.defined())
@@ -1485,7 +1516,6 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
 
     output = xllm::kernel::scaled_matmul(matmul_params);
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
-    log_mmrs_quant_skip(reduce_mode, fc1_ctx, "fp8", input);
     check_fp8_activation_dynamic_supported(quant_args_);
 
     if (!input_is_parallelized_ && !skip_scatter) {
@@ -1498,7 +1528,6 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
     output = fp8_linear_forward(
         input, weight_, weight_scale_, scale, bias, output_dtype_);
   } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
-    log_mmrs_quant_skip(reduce_mode, fc1_ctx, "w8a8", input);
     CHECK(input_scale_is_loaded_ && input_scale_.defined())
         << "input_scale is required for w8a8 quant matmul.";
     CHECK(input_offset_is_loaded_ && input_offset_.defined())
@@ -1519,7 +1548,6 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
                                      quant_bias,
                                      output_dtype_);
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
-    log_mmrs_quant_skip(reduce_mode, fc1_ctx, "w8a8_dynamic", input);
     if (!input_is_parallelized_ && !skip_scatter) {
       input = xllm::parallel_state::scatter(input, process_group_);
     }
